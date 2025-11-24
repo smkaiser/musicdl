@@ -429,13 +429,19 @@ class TIDALTvSession():
             sys.platform.startswith("win") or sys.platform == "darwin" or bool(os.environ.get("DISPLAY"))
         )
         if has_display:
-            import tkinter as tk
-            from tkinter import messagebox
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes('-topmost', True)
-            messagebox.showinfo("TIDAL Login Required", msg, parent=root)
-            root.destroy()
+            try:
+                import tkinter as tk
+                from tkinter import messagebox
+            except Exception:
+                pass
+            else:
+                root = tk.Tk()
+                try:
+                    root.withdraw()
+                    root.attributes('-topmost', True)
+                    messagebox.showinfo("TIDAL Login Required", msg, parent=root)
+                finally:
+                    root.destroy()
         # --checking user log in or sign up status
         while True:
             resp = self.session.post(f'{base_url}/oauth2/token', data=data, **request_overrides)

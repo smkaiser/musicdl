@@ -14,27 +14,47 @@ import base64
 import tempfile
 import json_repair
 from xml.etree import ElementTree
+from collections.abc import Iterable
+from urllib.parse import urlencode, urljoin, urlparse
 from .base import BaseMusicClient
 from rich.progress import Progress
-from urllib.parse import urlencode, urljoin
 from ..utils import legalizestring, byte2mb, resp2json, isvalidresp, seconds2hms, touchdir, replacefile, usesearchheaderscookies, usedownloadheaderscookies, AudioLinkTester
 from ..utils.tidalutils import (
     TIDALTvSession, SearchResult, StreamRespond, StreamUrl, Manifest, Period, AdaptationSet, Representation, SegmentTemplate, SegmentList, SegmentTimelineEntry,
-    decryptfile, decryptsecuritytoken, pyavready, ffmpegready, remuxflacstream, setmetadata
+    decryptfile, decryptsecuritytoken, pyavready, ffmpegready, remuxflacstream, setmetadata, Track
 )
 
 
 '''TIDALMusicClient'''
 class TIDALMusicClient(BaseMusicClient):
     source = 'TIDALMusicClient'
+
     def __init__(self, **kwargs):
         super(TIDALMusicClient, self).__init__(**kwargs)
         self.tidal_session = TIDALTvSession(headers={}, cookies=self.default_cookies)
+
+        cached_session = False
         try:
-            self.tidal_session.loadfromcache()
-            self.tidal_session.refresh()
-        except:
+            cached_session = self.tidal_session.loadfromcache()
+        except Exception:
+            cached_session = False
+
+        if cached_session:
+            try:
+                self.tidal_session.refresh()
+            except Exception:
+                self.logger_handle.info(
+                    f'{self.source} cached session refresh failed; requesting a new device login.',
+                    disable_print=self.disable_print,
+                )
+                self.tidal_session.auth()
+        else:
+            self.logger_handle.info(
+                f'{self.source} cache not found; requesting a new device login.',
+                disable_print=self.disable_print,
+            )
             self.tidal_session.auth()
+
         self.tidal_session.cache()
         self._setauthheaders()
         self._initsession()
@@ -295,50 +315,11 @@ class TIDALMusicClient(BaseMusicClient):
             resp.raise_for_status()
             search_results = aigpy.model.dictToModel(resp2json(resp=resp), SearchResult()).tracks.items
             for search_result in search_results:
-                if search_result.id is None: continue
-                # --download results
-                download_result, download_url, ext, file_size = {}, "", "m4a", "0"
-                qualities = [('hi_res_lossless', 'HI_RES_LOSSLESS'), ('high_lossless', 'LOSSLESS'), ('low_320k', 'HIGH'), ('low_96k', 'LOW')]
-                for quality in qualities:
-                    params = {"playbackmode": "STREAM", "audioquality": quality[1], "assetpresentation": "FULL",}
-                    resp = self._saferequestget(f'https://tidal.com/v1/tracks/{search_result.id}/playbackinfo', params=params, **request_overrides)
-                    if not isvalidresp(resp): continue
-                    download_result = aigpy.model.dictToModel(resp2json(resp), StreamRespond())
-                    if ("vnd.tidal.bt" not in download_result.manifestMimeType) and ("dash+xml" not in download_result.manifestMimeType): continue
-                    try:
-                        download_url = self._parsemanifest(stream_resp=download_result)
-                    except:
-                        download_url = ''
-                    if not download_url: continue
-                    download_url_status = AudioLinkTester(headers=self.default_download_headers, cookies=self.default_download_cookies).test(download_url.urls[0], request_overrides)
-                    if download_url_status['ok']: break
-                    download_result, download_url, ext, file_size = {}, "", "m4a", "0"
-                if not download_url: continue
-                if not download_url_status['ok']: continue
-                ext = self._guessextension(stream_url=download_url)
-                duration = seconds2hms(search_result.duration)
-                # --lyric results
-                params = {'countryCode': self.tidal_session.storage.country_code, 'include': 'lyrics'}
-                resp = self._saferequestget(f'https://openapi.tidal.com/v2/tracks/{search_result.id}', params=params, **request_overrides)
-                if isvalidresp(resp):
-                    try:
-                        lyric_result = resp2json(resp)
-                        lyric = lyric_result.get('included', [{}])[0].get('attributes', {}).get('lrcText', 'NULL')
-                    except:
-                        lyric_result, lyric = {}, 'NULL'
-                else:
-                    lyric_result, lyric = {}, 'NULL'
-                # --construct song_info
-                song_info = dict(
-                    source=self.source, raw_data=dict(search_result=search_result, download_result=download_result, lyric_result=lyric_result), 
-                    download_url_status=download_url_status, download_url=download_url, ext=ext, file_size=byte2mb(file_size), lyric=lyric, duration=duration,
-                    song_name=legalizestring(search_result.title, replace_null_string='NULL'), 
-                    singers=legalizestring(', '.join([singer.name for singer in search_result.artists]), replace_null_string='NULL'), 
-                    album=legalizestring(search_result.album.title, replace_null_string='NULL'),
-                    identifier=search_result.id,
-                )
-                # --append to song_infos
-                song_infos.append(song_info)
+                if search_result.id is None:
+                    continue
+                song_info = self._build_song_info(track=search_result, request_overrides=request_overrides)
+                if song_info:
+                    song_infos.append(song_info)
             # --update progress
             progress.advance(progress_id, 1)
             progress.update(progress_id, description=f"{self.source}.search >>> {search_url} (Success)")
@@ -346,4 +327,241 @@ class TIDALMusicClient(BaseMusicClient):
         except Exception as err:
             progress.update(progress_id, description=f"{self.source}.search >>> {search_url} (Error: {err})")
         # return
+        return song_infos
+    '''_primarystreamurl'''
+    def _primarystreamurl(self, stream_url: StreamUrl):
+        if not isinstance(stream_url, StreamUrl):
+            return None
+        candidates = []
+        if getattr(stream_url, 'url', None):
+            candidates.append(stream_url.url)
+        urls = getattr(stream_url, 'urls', None)
+        if isinstance(urls, (list, tuple)):
+            candidates.extend([candidate for candidate in urls if candidate])
+        elif urls:
+            candidates.append(urls)
+        for candidate in candidates:
+            if candidate:
+                return candidate
+        return None
+    '''_fetchlyrics'''
+    def _fetchlyrics(self, track_id, request_overrides: dict = None):
+        lyric_result, lyric = {}, 'NULL'
+        overrides = copy.deepcopy(request_overrides or {})
+        overrides['params'] = {'countryCode': self.tidal_session.storage.country_code, 'include': 'lyrics'}
+        try:
+            resp = self._saferequestget(f'https://openapi.tidal.com/v2/tracks/{track_id}', **overrides)
+        except Exception:
+            return lyric_result, lyric
+        if isvalidresp(resp):
+            try:
+                lyric_result = resp2json(resp)
+                lyric = lyric_result.get('included', [{}])[0].get('attributes', {}).get('lrcText', 'NULL')
+            except Exception:
+                lyric_result, lyric = {}, 'NULL'
+        return lyric_result, lyric
+    '''_getstreamfortrack'''
+    def _getstreamfortrack(self, track_id, request_overrides: dict = None):
+        qualities = [
+            ('hi_res_lossless', 'HI_RES_LOSSLESS'),
+            ('high_lossless', 'LOSSLESS'),
+            ('low_320k', 'HIGH'),
+            ('low_96k', 'LOW'),
+        ]
+        base_url = f'https://tidal.com/v1/tracks/{track_id}/playbackinfo'
+        for _, quality in qualities:
+            overrides = copy.deepcopy(request_overrides or {})
+            overrides['params'] = {"playbackmode": "STREAM", "audioquality": quality, "assetpresentation": "FULL"}
+            resp = self._saferequestget(base_url, **overrides)
+            if not isvalidresp(resp):
+                continue
+            download_result = aigpy.model.dictToModel(resp2json(resp=resp), StreamRespond())
+            if ("vnd.tidal.bt" not in download_result.manifestMimeType) and ("dash+xml" not in download_result.manifestMimeType):
+                continue
+            try:
+                stream_url = self._parsemanifest(stream_resp=download_result)
+            except Exception:
+                stream_url = None
+            if not stream_url:
+                continue
+            primary_url = self._primarystreamurl(stream_url)
+            if not primary_url:
+                continue
+            download_url_status = AudioLinkTester(headers=self.default_download_headers, cookies=self.default_download_cookies).test(primary_url, request_overrides)
+            if download_url_status.get('ok'):
+                return download_result, stream_url, download_url_status
+        return None, None, {'ok': False, 'reason': 'No playable stream found'}
+    '''_extractartistnames'''
+    def _extractartistnames(self, track: Track):
+        names = []
+        artists_attr = getattr(track, 'artists', None)
+        if isinstance(artists_attr, Iterable) and not isinstance(artists_attr, (str, bytes)):
+            for artist in artists_attr:
+                name = getattr(artist, 'name', None)
+                if name:
+                    names.append(name)
+        primary_artist = getattr(track, 'artist', None)
+        if not names and primary_artist is not None:
+            name = getattr(primary_artist, 'name', None)
+            if name:
+                names.append(name)
+        return names
+    '''_build_song_info'''
+    def _build_song_info(self, track: Track, request_overrides: dict = None):
+        request_overrides = request_overrides or {}
+        try:
+            download_result, stream_url, download_url_status = self._getstreamfortrack(track_id=track.id, request_overrides=request_overrides)
+            if not stream_url or not download_url_status.get('ok'):
+                return None
+            ext = self._guessextension(stream_url=stream_url)
+            duration = seconds2hms(track.duration)
+            lyric_result, lyric = self._fetchlyrics(track_id=track.id, request_overrides=request_overrides)
+            singer_names = self._extractartistnames(track)
+            album = getattr(track, 'album', None)
+            album_title = getattr(album, 'title', 'NULL') if album else 'NULL'
+            song_info = dict(
+                source=self.source,
+                raw_data=dict(search_result=track, download_result=download_result, lyric_result=lyric_result),
+                download_url_status=download_url_status,
+                download_url=stream_url,
+                ext=ext,
+                file_size=byte2mb(download_url_status.get('clen')),
+                lyric=lyric,
+                duration=duration,
+                song_name=legalizestring(getattr(track, 'title', 'NULL'), replace_null_string='NULL'),
+                singers=legalizestring(', '.join(singer_names), replace_null_string='NULL'),
+                album=legalizestring(album_title, replace_null_string='NULL'),
+                identifier=track.id,
+            )
+            return song_info
+        except Exception as err:
+            self.logger_handle.error(f"{self.source}._build_song_info >>> {getattr(track, 'id', 'UNKNOWN')} (Error: {err})", disable_print=self.disable_print)
+            return None
+    '''_fetchtrackmetadata'''
+    def _fetchtrackmetadata(self, track_id: str, request_overrides: dict = None):
+        overrides = copy.deepcopy(request_overrides or {})
+        overrides['params'] = {'countryCode': self.tidal_session.storage.country_code}
+        try:
+            resp = self._saferequestget(f'https://api.tidal.com/v1/tracks/{track_id}', **overrides)
+        except Exception as err:
+            self.logger_handle.error(f"{self.source}._fetchtrackmetadata >>> {track_id} (Error: {err})", disable_print=self.disable_print)
+            return None
+        if not isvalidresp(resp):
+            return None
+        try:
+            return aigpy.model.dictToModel(resp2json(resp=resp), Track())
+        except Exception as err:
+            self.logger_handle.error(f"{self.source}._fetchtrackmetadata >>> {track_id} (Parse Error: {err})", disable_print=self.disable_print)
+            return None
+    '''_fetchalbumtracks'''
+    def _fetchalbumtracks(self, album_id: str, request_overrides: dict = None):
+        tracks = []
+        offset, limit = 0, 100
+        while True:
+            overrides = copy.deepcopy(request_overrides or {})
+            overrides['params'] = {'countryCode': self.tidal_session.storage.country_code, 'limit': limit, 'offset': offset}
+            resp = self._saferequestget(f'https://api.tidal.com/v1/albums/{album_id}/tracks', **overrides)
+            if not isvalidresp(resp):
+                break
+            data = resp2json(resp=resp)
+            items = data.get('items') or []
+            if not isinstance(items, list) or len(items) == 0:
+                break
+            for item in items:
+                track_data = item.get('track') if isinstance(item, dict) and 'track' in item else item
+                try:
+                    track_model = aigpy.model.dictToModel(track_data, Track())
+                except Exception:
+                    continue
+                if getattr(track_model, 'id', None) is None:
+                    continue
+                tracks.append(track_model)
+            offset += len(items)
+            total = data.get('totalNumberOfItems')
+            if len(items) < limit or (isinstance(total, int) and offset >= total):
+                break
+        return tracks
+    '''_fetchplaylisttracks'''
+    def _fetchplaylisttracks(self, playlist_id: str, request_overrides: dict = None):
+        tracks = []
+        offset, limit = 0, 100
+        while True:
+            overrides = copy.deepcopy(request_overrides or {})
+            overrides['params'] = {'countryCode': self.tidal_session.storage.country_code, 'limit': limit, 'offset': offset}
+            resp = self._saferequestget(f'https://api.tidal.com/v1/playlists/{playlist_id}/tracks', **overrides)
+            if not isvalidresp(resp):
+                break
+            data = resp2json(resp=resp)
+            items = data.get('items') or []
+            if not isinstance(items, list) or len(items) == 0:
+                break
+            for item in items:
+                track_data = item.get('track') if isinstance(item, dict) and 'track' in item else item
+                try:
+                    track_model = aigpy.model.dictToModel(track_data, Track())
+                except Exception:
+                    continue
+                if getattr(track_model, 'id', None) is None:
+                    continue
+                tracks.append(track_model)
+            offset += len(items)
+            total = data.get('totalNumberOfItems')
+            if len(items) < limit or (isinstance(total, int) and offset >= total):
+                break
+        return tracks
+    '''_buildsonginfosfromtracks'''
+    def _buildsonginfosfromtracks(self, tracks: list, request_overrides: dict = None):
+        song_infos = []
+        for track in tracks:
+            if track is None or getattr(track, 'id', None) is None:
+                continue
+            song_info = self._build_song_info(track=track, request_overrides=request_overrides)
+            if song_info:
+                song_infos.append(song_info)
+        return self._removeduplicates(song_infos=song_infos)
+    '''_parsetidalresource'''
+    def _parsetidalresource(self, tidal_url: str):
+        parsed = urlparse(tidal_url)
+        segments = [segment for segment in parsed.path.split('/') if segment]
+        if segments and segments[0].lower() == 'browse':
+            segments = segments[1:]
+        resource_type, resource_id = None, None
+        for idx, segment in enumerate(segments):
+            lowered = segment.lower()
+            if lowered in ('track', 'album', 'playlist'):
+                if idx + 1 >= len(segments):
+                    break
+                resource_type = lowered
+                resource_id = segments[idx + 1]
+                break
+        if not resource_type or not resource_id:
+            raise ValueError(f'Unsupported TIDAL url: {tidal_url}')
+        return resource_type, resource_id
+    '''parse_url'''
+    def parse_url(self, tidal_url: str, request_overrides: dict = None):
+        request_overrides = request_overrides or {}
+        resource_type, resource_id = self._parsetidalresource(tidal_url)
+        tracks = []
+        if resource_type == 'track':
+            track = self._fetchtrackmetadata(resource_id, request_overrides=request_overrides)
+            if track:
+                tracks.append(track)
+        elif resource_type == 'album':
+            tracks = self._fetchalbumtracks(resource_id, request_overrides=request_overrides)
+        elif resource_type == 'playlist':
+            tracks = self._fetchplaylisttracks(resource_id, request_overrides=request_overrides)
+        if not tracks:
+            return []
+        song_infos = self._buildsonginfosfromtracks(tracks=tracks, request_overrides=request_overrides)
+        if not song_infos:
+            return []
+        keyword = f"tidal_{resource_type}_{resource_id}"
+        work_dir = self._constructuniqueworkdir(keyword=keyword)
+        for song_info in song_infos:
+            song_info['work_dir'] = work_dir
+        try:
+            self._savetopkl(song_infos, os.path.join(work_dir, 'parse_results.pkl'))
+        except Exception:
+            pass
+        self.logger_handle.info(f'Parsed {len(song_infos)} tracks from {resource_type} {resource_id}.', disable_print=self.disable_print)
         return song_infos

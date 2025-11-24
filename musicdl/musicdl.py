@@ -101,6 +101,16 @@ class MusicClient():
             selected_song_infos = []
             for idx in user_input_select_song_info_pointer: selected_song_infos.append(song_infos[idx])
             self.download(selected_song_infos)
+    '''parsetidalurl'''
+    def parsetidalurl(self, tidal_url: str):
+        tidal_source = 'TIDALMusicClient'
+        if tidal_source not in self.music_clients:
+            raise ValueError('TIDALMusicClient is not enabled. Include it via --music-sources to parse TIDAL URLs.')
+        tidal_client = self.music_clients[tidal_source]
+        request_overrides = self.requests_overrides.get(tidal_source, {})
+        self.logger_handle.info(f'Parsing TIDAL URL: {tidal_url}')
+        song_infos = tidal_client.parse_url(tidal_url=tidal_url, request_overrides=request_overrides)
+        return song_infos
     '''search'''
     def search(self, keyword):
         self.logger_handle.info(f'Searching {colorize(keyword, "highlight")} From {colorize("|".join(self.music_sources), "highlight")}')
@@ -146,6 +156,9 @@ class MusicClient():
 @click.command()
 @click.version_option()
 @click.option(
+    '-u', '--tidal-url', '--tidal_url', default=None, help='TIDAL track/album/playlist URL to resolve and download.', type=str,
+)
+@click.option(
     '-k', '--keyword', default=None, help='The keywords for the music search. If left empty, an interactive terminal will open automatically.', type=str, show_default=True,
 )
 @click.option(
@@ -163,7 +176,7 @@ class MusicClient():
 @click.option(
     '-s', '--search-rules', '--search_rules', default=None, help='Search rules for each music client as a JSON string.', type=str, show_default=True,
 )
-def MusicClientCMD(keyword: str, music_sources: str, init_music_clients_cfg: str, requests_overrides: str, clients_threadings: str, search_rules: str):
+def MusicClientCMD(tidal_url: str, keyword: str, music_sources: str, init_music_clients_cfg: str, requests_overrides: str, clients_threadings: str, search_rules: str):
     # load json string
     def _safe_load(string):
         if string is not None:
@@ -171,17 +184,35 @@ def MusicClientCMD(keyword: str, music_sources: str, init_music_clients_cfg: str
         else:
             result = {}
         return result
+    tidal_url = tidal_url.strip() if tidal_url else None
+    if tidal_url and keyword:
+        raise click.UsageError('Please supply either --keyword or --tidal-url, not both.')
     init_music_clients_cfg = _safe_load(init_music_clients_cfg)
     requests_overrides = _safe_load(requests_overrides)
     clients_threadings = _safe_load(clients_threadings)
     search_rules = _safe_load(search_rules)
     # instance music client
-    music_sources = music_sources.replace(' ', '').split(',')
+    music_sources = [source for source in music_sources.replace(' ', '').split(',') if source]
+    if tidal_url and 'TIDALMusicClient' not in music_sources:
+        music_sources.append('TIDALMusicClient')
     music_client = MusicClient(
         music_sources=music_sources, init_music_clients_cfg=init_music_clients_cfg, clients_threadings=clients_threadings, 
         requests_overrides=requests_overrides, search_rules=search_rules,
     )
     # switch according to keyword
+    if tidal_url:
+        print(music_client)
+        try:
+            resolved_song_infos = music_client.parsetidalurl(tidal_url)
+        except ValueError as err:
+            raise click.BadParameter(str(err), param_hint='tidal-url')
+        except Exception as err:
+            raise click.ClickException(f'Failed to parse TIDAL URL: {err}')
+        if not resolved_song_infos:
+            raise click.ClickException('No downloadable tracks were found for the provided TIDAL URL.')
+        music_client.printsearchresults(search_results={'TIDALMusicClient': resolved_song_infos})
+        music_client.download(song_infos=resolved_song_infos)
+        return
     if keyword is None:
         music_client.startcmdui()
     else:
