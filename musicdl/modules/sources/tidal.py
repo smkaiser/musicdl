@@ -419,6 +419,18 @@ class TIDALMusicClient(BaseMusicClient):
             singer_names = self._extractartistnames(track)
             album = getattr(track, 'album', None)
             album_title = getattr(album, 'title', 'NULL') if album else 'NULL'
+            track_number_candidates = [
+                getattr(track, 'trackNumber', None),
+                getattr(track, 'number', None),
+                getattr(track, 'trackNumberOnAlbum', None),
+                getattr(track, 'sequence', None),
+                getattr(track, 'trackNumberOnPlaylist', None),
+            ]
+            track_number = None
+            for candidate in track_number_candidates:
+                track_number = self._normalizetracknumber(candidate)
+                if track_number is not None:
+                    break
             song_info = dict(
                 source=self.source,
                 raw_data=dict(search_result=track, download_result=download_result, lyric_result=lyric_result),
@@ -432,6 +444,7 @@ class TIDALMusicClient(BaseMusicClient):
                 singers=legalizestring(', '.join(singer_names), replace_null_string='NULL'),
                 album=legalizestring(album_title, replace_null_string='NULL'),
                 identifier=track.id,
+                track_number=track_number,
             )
             return song_info
         except Exception as err:
@@ -556,11 +569,23 @@ class TIDALMusicClient(BaseMusicClient):
         if not song_infos:
             return []
         keyword = f"tidal_{resource_type}_{resource_id}"
-        work_dir = self._constructuniqueworkdir(keyword=keyword)
+        assigned_work_dirs = []
+        album_artist_map = {}
         for song_info in song_infos:
+            album_name = song_info.get('album') if isinstance(song_info, dict) else None
+            album_key = album_name.strip().lower() if isinstance(album_name, str) else None
+            resolved_artist = album_artist_map.get(album_key) if album_key else None
+            if not resolved_artist:
+                resolved_artist = self._resolve_artist_name(song_info=song_info, keyword=keyword)
+                if album_key:
+                    album_artist_map[album_key] = resolved_artist
+            work_dir = self._constructuniqueworkdir(song_info=song_info, keyword=keyword, album_artist=resolved_artist)
             song_info['work_dir'] = work_dir
+            assigned_work_dirs.append(work_dir)
         try:
-            self._savetopkl(song_infos, os.path.join(work_dir, 'parse_results.pkl'))
+            results_dir = assigned_work_dirs[0] if assigned_work_dirs else self.work_dir
+            touchdir(results_dir)
+            self._savetopkl(song_infos, os.path.join(results_dir, 'parse_results.pkl'))
         except Exception:
             pass
         self.logger_handle.info(f'Parsed {len(song_infos)} tracks from {resource_type} {resource_id}.', disable_print=self.disable_print)

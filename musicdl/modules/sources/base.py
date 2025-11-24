@@ -10,12 +10,11 @@ import os
 import copy
 import pickle
 import requests
-from datetime import datetime
 from freeproxy import freeproxy
 from fake_useragent import UserAgent
 from pathvalidate import sanitize_filepath
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from ..utils import LoggerHandle, touchdir, usedownloadheaderscookies, usesearchheaderscookies
+from ..utils import LoggerHandle, legalizestring, touchdir, usedownloadheaderscookies, usesearchheaderscookies
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn, MofNCompleteColumn
 
 
@@ -57,10 +56,152 @@ class BaseMusicClient():
     '''_constructsearchurls'''
     def _constructsearchurls(self, keyword: str, rule: dict = None, request_overrides: dict = None):
         raise NotImplementedError('not to be implemented')
+    @staticmethod
+    def _extract_name_from_data(data):
+        if data is None:
+            return None
+        if isinstance(data, str):
+            cleaned = data.strip()
+            if cleaned and cleaned.upper() != 'NULL':
+                return cleaned
+            return None
+        if isinstance(data, dict):
+            for key in ('album_artist', 'artist', 'artists', 'name', 'title', 'singer', 'singers'):
+                candidate = BaseMusicClient._extract_name_from_data(data.get(key))
+                if candidate:
+                    return candidate
+            for key, value in data.items():
+                if key.lower().endswith('name'):
+                    candidate = BaseMusicClient._extract_name_from_data(value)
+                    if candidate:
+                        return candidate
+            return None
+        if isinstance(data, (list, tuple, set)):
+            for item in data:
+                candidate = BaseMusicClient._extract_name_from_data(item)
+                if candidate:
+                    return candidate
+            return None
+        for attr in ('album_artist', 'artist', 'artists', 'name', 'title', 'singer', 'singers'):
+            if hasattr(data, attr):
+                attr_value = getattr(data, attr)
+                if attr_value is data:
+                    continue
+                candidate = BaseMusicClient._extract_name_from_data(attr_value)
+                if candidate:
+                    return candidate
+        return None
+    @staticmethod
+    def _strip_featured_artist(name: str):
+        cleaned = name.strip()
+        lowered = cleaned.lower()
+        feature_tokens = [' feat.', ' featuring', ' ft.', ' ft ', ' with ', ' x ', ' × ', ' presents ', ' pres. ']
+        for token in feature_tokens:
+            idx = lowered.find(token)
+            if idx != -1:
+                cleaned = cleaned[:idx]
+                lowered = cleaned.lower()
+        for separator in [',', '，', '、']:
+            if separator in cleaned:
+                cleaned = cleaned.split(separator)[0]
+                break
+        return cleaned.strip(' -&')
+    def _resolve_artist_name(self, song_info: dict = None, keyword: str = '', preferred_artist: str = ''):
+        song_info = song_info or {}
+        keyword = keyword or ''
+        raw_data = song_info.get('raw_data') or {}
+        search_result = raw_data.get('search_result')
+        candidates = [preferred_artist, song_info.get('album_artist'), raw_data.get('album_artist')]
+        if isinstance(search_result, dict):
+            candidates.extend([
+                search_result.get('album'), search_result.get('al'), search_result.get('artists'), search_result.get('artist'),
+                search_result.get('ar'), search_result.get('singers'), search_result.get('singer'),
+            ])
+        elif search_result is not None:
+            for attr in ('album', 'artist', 'artists', 'primaryArtist'):
+                candidates.append(getattr(search_result, attr, None))
+        candidates.extend([
+            song_info.get('singers'), song_info.get('artist'), song_info.get('artists'), song_info.get('singer'),
+        ])
+        if keyword:
+            candidates.append(keyword)
+        for candidate in candidates:
+            name = self._extract_name_from_data(candidate)
+            if not name:
+                continue
+            stripped = self._strip_featured_artist(name)
+            stripped = stripped.strip()
+            if stripped:
+                return stripped
+        return 'Unknown Artist'
+    def _resolve_album_name(self, song_info: dict = None, keyword: str = ''):
+        song_info = song_info or {}
+        raw_data = song_info.get('raw_data') or {}
+        search_result = raw_data.get('search_result')
+        candidates = [
+            song_info.get('album'), song_info.get('album_name'), song_info.get('albumTitle'), song_info.get('record'),
+        ]
+        if isinstance(search_result, dict):
+            candidates.extend([search_result.get('album'), search_result.get('al'), search_result.get('album_name')])
+        elif search_result is not None:
+            candidates.append(getattr(search_result, 'album', None))
+        download_result = raw_data.get('download_result')
+        if isinstance(download_result, dict):
+            candidates.append(download_result.get('album'))
+        candidates.append(keyword)
+        for candidate in candidates:
+            name = self._extract_name_from_data(candidate)
+            if name:
+                return name
+        return 'Unknown Album'
+    @staticmethod
+    def _normalizetracknumber(value):
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                normalized = BaseMusicClient._normalizetracknumber(item)
+                if normalized is not None:
+                    return normalized
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped or stripped.upper() == 'NULL':
+                return None
+            for sep in ('/', '-', '.', ' '):
+                if sep in stripped:
+                    stripped = stripped.split(sep)[0]
+                    break
+            if stripped.isdigit():
+                candidate = int(stripped)
+                return candidate if candidate > 0 else None
+            try:
+                candidate = int(float(stripped))
+                return candidate if candidate > 0 else None
+            except (ValueError, TypeError):
+                return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                candidate = int(value)
+            except (ValueError, TypeError):
+                return None
+            return candidate if candidate > 0 else None
+        if hasattr(value, '__int__'):
+            try:
+                candidate = int(value)
+                return candidate if candidate > 0 else None
+            except Exception:
+                return None
+        return None
     '''_constructuniqueworkdir'''
-    def _constructuniqueworkdir(self, keyword: str):
-        time_stamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-        work_dir = os.path.join(self.work_dir, self.source, f'{time_stamp} {keyword.replace(" ", "")}')
+    def _constructuniqueworkdir(self, song_info: dict = None, keyword: str = '', album_artist: str = ''):
+        artist_raw = self._resolve_artist_name(song_info=song_info, keyword=keyword, preferred_artist=album_artist)
+        album_raw = self._resolve_album_name(song_info=song_info, keyword=keyword)
+        artist_dir = legalizestring(artist_raw, replace_null_string='Unknown Artist')
+        album_dir = legalizestring(album_raw, replace_null_string='Unknown Album')
+        work_dir = os.path.join(self.work_dir, artist_dir, album_dir)
         touchdir(work_dir)
         return work_dir
     '''_removeduplicates'''
@@ -98,9 +239,19 @@ class BaseMusicClient():
                     num_searched_urls = int(progress.tasks[progress_id].completed)
                     progress.update(progress_id, description=f"{self.source}.search >>> completed ({num_searched_urls}/{len(search_urls)})")
         song_infos = self._removeduplicates(song_infos=song_infos)
-        work_dir = self._constructuniqueworkdir(keyword=keyword)
+        album_artist_map = {}
         for song_info in song_infos:
-            song_info['work_dir'] = work_dir
+            album_name = song_info.get('album') if isinstance(song_info, dict) else None
+            if isinstance(album_name, str):
+                album_key = album_name.strip().lower()
+            else:
+                album_key = None
+            resolved_artist = album_artist_map.get(album_key) if album_key else None
+            if not resolved_artist:
+                resolved_artist = self._resolve_artist_name(song_info=song_info, keyword=keyword)
+                if album_key:
+                    album_artist_map[album_key] = resolved_artist
+            song_info['work_dir'] = self._constructuniqueworkdir(song_info=song_info, keyword=keyword, album_artist=resolved_artist)
         # logging
         if len(song_infos) > 0:
             work_dir = song_infos[0]['work_dir']
@@ -122,9 +273,18 @@ class BaseMusicClient():
                 resp.raise_for_status()
                 total_size, chunk_size, downloaded_size = int(resp.headers.get('content-length', 0)), song_info.get('chunk_size', 1024), 0
                 progress.update(song_progress_id, total=total_size)
-                save_path, same_name_file_idx = os.path.join(song_info['work_dir'], f"{song_info['song_name']}.{song_info['ext']}"), 1
+                track_prefix = ''
+                track_number = self._normalizetracknumber(song_info.get('track_number'))
+                if track_number is None:
+                    # also consider disc information appearing under misc keys
+                    track_number = self._normalizetracknumber(song_info.get('trackNumber'))
+                if track_number is not None:
+                    track_prefix = f"{track_number:02d} - "
+                file_base = f"{track_prefix}{song_info['song_name']}"
+                save_path = os.path.join(song_info['work_dir'], f"{file_base}.{song_info['ext']}")
+                same_name_file_idx = 1
                 while os.path.exists(save_path):
-                    save_path = os.path.join(song_info['work_dir'], f"{song_info['song_name']}_{same_name_file_idx}.{song_info['ext']}")
+                    save_path = os.path.join(song_info['work_dir'], f"{file_base}_{same_name_file_idx}.{song_info['ext']}")
                     same_name_file_idx += 1
                 with open(save_path, "wb") as fp:
                     for chunk in resp.iter_content(chunk_size=chunk_size):
