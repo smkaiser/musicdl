@@ -119,11 +119,11 @@ class BaseMusicClient():
         candidates = [preferred_artist, song_info.get('album_artist_resolved'), song_info.get('album_artist'), raw_data.get('album_artist')]
         if isinstance(search_result, dict):
             candidates.extend([
-                search_result.get('album'), search_result.get('al'), search_result.get('artists'), search_result.get('artist'),
+                search_result.get('artists'), search_result.get('artist'),
                 search_result.get('ar'), search_result.get('singers'), search_result.get('singer'),
             ])
         elif search_result is not None:
-            for attr in ('album', 'artist', 'artists', 'primaryArtist'):
+            for attr in ('artist', 'artists', 'primaryArtist'):
                 candidates.append(getattr(search_result, attr, None))
         candidates.extend([
             song_info.get('singers'), song_info.get('artist'), song_info.get('artists'), song_info.get('singer'),
