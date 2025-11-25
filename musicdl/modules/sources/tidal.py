@@ -21,7 +21,7 @@ from rich.progress import Progress
 from ..utils import legalizestring, byte2mb, resp2json, isvalidresp, seconds2hms, touchdir, replacefile, usesearchheaderscookies, usedownloadheaderscookies, AudioLinkTester
 from ..utils.tidalutils import (
     TIDALTvSession, SearchResult, StreamRespond, StreamUrl, Manifest, Period, AdaptationSet, Representation, SegmentTemplate, SegmentList, SegmentTimelineEntry,
-    decryptfile, decryptsecuritytoken, pyavready, ffmpegready, remuxflacstream, setmetadata, Track
+    decryptfile, decryptsecuritytoken, pyavready, ffmpegready, remuxflacstream, setmetadata, extractmediatags, Track
 )
 
 
@@ -284,19 +284,31 @@ class TIDALMusicClient(BaseMusicClient):
                     else:
                         final_ext = download_ext
                         decrypted_path = decrypted_path
-                save_path, same_name_file_idx = os.path.join(song_info['work_dir'], f"{song_info['song_name']}{final_ext}"), 1
+                normalized_ext = final_ext if str(final_ext).startswith('.') else f".{final_ext}"
+                track_prefix = ''
+                if 'album_artist_resolved' not in song_info:
+                    song_info['album_artist_resolved'] = self._resolve_artist_name(song_info=song_info)
+                track_number = self._normalizetracknumber(song_info.get('track_number'))
+                if track_number is None:
+                    track_number = self._normalizetracknumber(song_info.get('trackNumber'))
+                if track_number is not None:
+                    track_prefix = f"{track_number:02d} - "
+                file_base = f"{track_prefix}{song_info['song_name']}"
+                save_path = os.path.join(song_info['work_dir'], f"{file_base}{normalized_ext}")
+                same_name_file_idx = 1
                 while os.path.exists(save_path):
-                    save_path = os.path.join(song_info['work_dir'], f"{song_info['song_name']}_{same_name_file_idx}{final_ext}")
+                    save_path = os.path.join(song_info['work_dir'], f"{file_base}_{same_name_file_idx}{normalized_ext}")
                     same_name_file_idx += 1
                 replacefile(decrypted_path, save_path)
                 setmetadata(track=song_info['raw_data']['search_result'], filepath=save_path, stream=stream_url)
+                self._apply_metadata(save_path, song_info)
             # update progress
             progress.advance(song_progress_id, 1)
             progress.advance(songs_progress_id, 1)
             progress.update(song_progress_id, description=f"{self.source}.download >>> {song_info['song_name']} (Success)")
             downloaded_song_info = copy.deepcopy(song_info)
             downloaded_song_info['save_path'] = save_path
-            downloaded_song_info['ext'] = final_ext
+            downloaded_song_info['ext'] = normalized_ext.lstrip('.')
             downloaded_song_infos.append(downloaded_song_info)
         # failure
         except Exception as err:
@@ -419,6 +431,8 @@ class TIDALMusicClient(BaseMusicClient):
             singer_names = self._extractartistnames(track)
             album = getattr(track, 'album', None)
             album_title = getattr(album, 'title', 'NULL') if album else 'NULL'
+            album_artist_obj = getattr(album, 'artist', None) if album else None
+            album_artist_name = getattr(album_artist_obj, 'name', None) if album_artist_obj else None
             track_number_candidates = [
                 getattr(track, 'trackNumber', None),
                 getattr(track, 'number', None),
@@ -431,6 +445,18 @@ class TIDALMusicClient(BaseMusicClient):
                 track_number = self._normalizetracknumber(candidate)
                 if track_number is not None:
                     break
+            track_total = getattr(album, 'numberOfTracks', None) if album else None
+            disc_number = getattr(track, 'volumeNumber', None)
+            disc_total = getattr(album, 'numberOfVolumes', None) if album else None
+            release_date = getattr(album, 'releaseDate', None) if album else None
+            if not release_date:
+                release_date = getattr(track, 'streamStartDate', None)
+            tidal_genres = extractmediatags(track, album)
+            cleaned_genres = []
+            for genre in tidal_genres:
+                cleaned = legalizestring(genre, replace_null_string='NULL')
+                if cleaned and cleaned.upper() != 'NULL':
+                    cleaned_genres.append(cleaned)
             song_info = dict(
                 source=self.source,
                 raw_data=dict(search_result=track, download_result=download_result, lyric_result=lyric_result),
@@ -446,6 +472,22 @@ class TIDALMusicClient(BaseMusicClient):
                 identifier=track.id,
                 track_number=track_number,
             )
+            if album_artist_name:
+                album_artist_clean = legalizestring(album_artist_name, replace_null_string='NULL')
+                song_info['album_artist'] = album_artist_clean
+                song_info['album_artist_resolved'] = album_artist_clean
+            if track_total:
+                song_info['track_total'] = track_total
+            if disc_number:
+                song_info['disc_number'] = disc_number
+            if disc_total:
+                song_info['disc_total'] = disc_total
+            if release_date:
+                song_info['release_date'] = release_date
+            if getattr(track, 'isrc', None):
+                song_info['isrc'] = track.isrc
+            if cleaned_genres:
+                song_info['genres'] = cleaned_genres
             return song_info
         except Exception as err:
             self.logger_handle.error(f"{self.source}._build_song_info >>> {getattr(track, 'id', 'UNKNOWN')} (Error: {err})", disable_print=self.disable_print)
@@ -580,6 +622,7 @@ class TIDALMusicClient(BaseMusicClient):
                 if album_key:
                     album_artist_map[album_key] = resolved_artist
             work_dir = self._constructuniqueworkdir(song_info=song_info, keyword=keyword, album_artist=resolved_artist)
+            song_info['album_artist_resolved'] = resolved_artist
             song_info['work_dir'] = work_dir
             assigned_work_dirs.append(work_dir)
         try:

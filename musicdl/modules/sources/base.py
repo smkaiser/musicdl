@@ -7,6 +7,7 @@ WeChat Official Account (微信公众号):
     Charles的皮卡丘
 '''
 import os
+import re
 import copy
 import pickle
 import requests
@@ -14,6 +15,10 @@ from freeproxy import freeproxy
 from fake_useragent import UserAgent
 from pathvalidate import sanitize_filepath
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from mutagen import File as MutagenFile
+from mutagen.easyid3 import EasyID3
+from mutagen.id3 import ID3NoHeaderError
+from mutagen.mp3 import MP3
 from ..utils import LoggerHandle, legalizestring, touchdir, usedownloadheaderscookies, usesearchheaderscookies
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn, MofNCompleteColumn
 
@@ -111,7 +116,7 @@ class BaseMusicClient():
         keyword = keyword or ''
         raw_data = song_info.get('raw_data') or {}
         search_result = raw_data.get('search_result')
-        candidates = [preferred_artist, song_info.get('album_artist'), raw_data.get('album_artist')]
+        candidates = [preferred_artist, song_info.get('album_artist_resolved'), song_info.get('album_artist'), raw_data.get('album_artist')]
         if isinstance(search_result, dict):
             candidates.extend([
                 search_result.get('album'), search_result.get('al'), search_result.get('artists'), search_result.get('artist'),
@@ -155,6 +160,22 @@ class BaseMusicClient():
                 return name
         return 'Unknown Album'
     @staticmethod
+    def _normalizedate(value):
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                candidate = BaseMusicClient._normalizedate(item)
+                if candidate:
+                    return candidate
+            return None
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if not cleaned or cleaned.upper() == 'NULL':
+                return None
+            return cleaned
+        return str(value)
+    @staticmethod
     def _normalizetracknumber(value):
         if value is None:
             return None
@@ -195,10 +216,162 @@ class BaseMusicClient():
             except Exception:
                 return None
         return None
+    @staticmethod
+    def _split_artists(value):
+        if value is None:
+            return []
+        artists = []
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if not cleaned or cleaned.upper() == 'NULL':
+                return []
+            for part in re.split(r'[;,/]', cleaned):
+                candidate = part.strip()
+                if candidate and candidate.upper() != 'NULL':
+                    artists.append(candidate)
+            if not artists:
+                artists.append(cleaned)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                artists.extend(BaseMusicClient._split_artists(item))
+        else:
+            artists.extend(BaseMusicClient._split_artists(str(value)))
+        deduped = []
+        seen = set()
+        for artist in artists:
+            lowered = artist.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            deduped.append(artist)
+        return deduped
+    @staticmethod
+    def _sanitize_metadata_value(value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if not cleaned or cleaned.upper() == 'NULL':
+                return None
+            return cleaned
+        if isinstance(value, bool):
+            return '1' if value else '0'
+        try:
+            return str(value)
+        except Exception:
+            return None
+    def _build_metadata_payload(self, song_info: dict):
+        metadata = {}
+        if not isinstance(song_info, dict):
+            return metadata
+        title = self._sanitize_metadata_value(song_info.get('song_name'))
+        version_value = None
+        raw_data = song_info.get('raw_data') if isinstance(song_info, dict) else None
+        search_result = raw_data.get('search_result') if isinstance(raw_data, dict) else None
+        if isinstance(search_result, dict):
+            version_value = self._sanitize_metadata_value(search_result.get('version'))
+        elif search_result is not None:
+            version_value = self._sanitize_metadata_value(getattr(search_result, 'version', None))
+        if title:
+            if version_value and version_value.lower() not in title.lower():
+                metadata['title'] = [f"{title} ({version_value})"]
+            else:
+                metadata['title'] = [title]
+        artists_value = song_info.get('singers') or song_info.get('artist') or song_info.get('artists') or song_info.get('album_artist')
+        artists = self._split_artists(artists_value)
+        if artists:
+            metadata['artist'] = artists
+        album_artist = song_info.get('album_artist_resolved') or (artists[0] if artists else None)
+        if not album_artist:
+            album_artist = self._resolve_artist_name(song_info=song_info)
+        album_artist = self._sanitize_metadata_value(album_artist)
+        if album_artist:
+            metadata['albumartist'] = [album_artist]
+        album = self._sanitize_metadata_value(song_info.get('album'))
+        if album:
+            metadata['album'] = [album]
+        track_number = self._normalizetracknumber(song_info.get('track_number') or song_info.get('trackNumber'))
+        track_total = self._normalizetracknumber(song_info.get('track_total') or song_info.get('trackTotal'))
+        if track_number:
+            track_tag = f"{track_number}" if not track_total else f"{track_number}/{track_total}"
+            metadata['tracknumber'] = [track_tag]
+        disc_number = self._normalizetracknumber(song_info.get('disc_number') or song_info.get('discNumber'))
+        disc_total = self._normalizetracknumber(song_info.get('disc_total') or song_info.get('discTotal'))
+        if disc_number:
+            disc_tag = f"{disc_number}" if not disc_total else f"{disc_number}/{disc_total}"
+            metadata['discnumber'] = [disc_tag]
+        release_date = self._normalizedate(song_info.get('release_date') or song_info.get('releaseDate'))
+        if release_date:
+            metadata['date'] = [release_date]
+        isrc = self._sanitize_metadata_value(song_info.get('isrc'))
+        if isrc:
+            metadata['isrc'] = [isrc]
+        genres = song_info.get('genres')
+        if isinstance(genres, (list, tuple, set)):
+            cleaned_genres = []
+            for genre in genres:
+                genre_value = self._sanitize_metadata_value(genre)
+                if genre_value:
+                    cleaned_genres.append(genre_value)
+            if cleaned_genres:
+                metadata['genre'] = cleaned_genres
+        else:
+            genre_value = self._sanitize_metadata_value(genres)
+            if genre_value:
+                metadata['genre'] = [genre_value]
+        lyric_value = self._sanitize_metadata_value(song_info.get('lyric'))
+        if lyric_value:
+            metadata['lyrics'] = [lyric_value]
+        identifier = self._sanitize_metadata_value(song_info.get('identifier'))
+        source_comment = f"Downloaded via musicdl ({self.source})"
+        if identifier:
+            source_comment += f" | ID: {identifier}"
+        metadata['comment'] = [source_comment]
+        return metadata
+    def _load_audio_tags(self, file_path: str, file_ext: str):
+        ext = (file_ext or '').lower().lstrip('.')
+        if not ext:
+            ext = os.path.splitext(file_path)[1].lower().lstrip('.')
+        audio = None
+        if ext in ('mp3', 'mp2', 'mpga', 'mpeg'):
+            try:
+                audio = EasyID3(file_path)
+            except ID3NoHeaderError:
+                mp3_file = MP3(file_path)
+                mp3_file.add_tags()
+                mp3_file.save()
+                audio = EasyID3(file_path)
+        else:
+            audio = MutagenFile(file_path, easy=True)
+            if audio and audio.tags is None:
+                audio.add_tags()
+        return audio
+    def _apply_metadata(self, file_path: str, song_info: dict):
+        try:
+            audio = self._load_audio_tags(file_path, song_info.get('ext'))
+        except Exception as err:
+            self.logger_handle.debug(f"{self.source}.metadata >>> Failed to initialize mutagen handler for {file_path}: {err}", disable_print=self.disable_print)
+            return
+        if audio is None:
+            return
+        metadata = self._build_metadata_payload(song_info)
+        if not metadata:
+            return
+        for key, value in metadata.items():
+            try:
+                audio[key] = value
+            except Exception as err:
+                self.logger_handle.debug(f"{self.source}.metadata >>> Failed to set tag {key} for {file_path}: {err}", disable_print=self.disable_print)
+        try:
+            audio.save()
+        except Exception as err:
+            self.logger_handle.debug(f"{self.source}.metadata >>> Failed to save tags for {file_path}: {err}", disable_print=self.disable_print)
     '''_constructuniqueworkdir'''
     def _constructuniqueworkdir(self, song_info: dict = None, keyword: str = '', album_artist: str = ''):
         artist_raw = self._resolve_artist_name(song_info=song_info, keyword=keyword, preferred_artist=album_artist)
         album_raw = self._resolve_album_name(song_info=song_info, keyword=keyword)
+        if isinstance(song_info, dict):
+            song_info.setdefault('album_artist_resolved', artist_raw)
         artist_dir = legalizestring(artist_raw, replace_null_string='Unknown Artist')
         album_dir = legalizestring(album_raw, replace_null_string='Unknown Album')
         work_dir = os.path.join(self.work_dir, artist_dir, album_dir)
@@ -251,6 +424,7 @@ class BaseMusicClient():
                 resolved_artist = self._resolve_artist_name(song_info=song_info, keyword=keyword)
                 if album_key:
                     album_artist_map[album_key] = resolved_artist
+            song_info['album_artist_resolved'] = resolved_artist
             song_info['work_dir'] = self._constructuniqueworkdir(song_info=song_info, keyword=keyword, album_artist=resolved_artist)
         # logging
         if len(song_infos) > 0:
@@ -274,6 +448,8 @@ class BaseMusicClient():
                 total_size, chunk_size, downloaded_size = int(resp.headers.get('content-length', 0)), song_info.get('chunk_size', 1024), 0
                 progress.update(song_progress_id, total=total_size)
                 track_prefix = ''
+                if 'album_artist_resolved' not in song_info:
+                    song_info['album_artist_resolved'] = self._resolve_artist_name(song_info=song_info)
                 track_number = self._normalizetracknumber(song_info.get('track_number'))
                 if track_number is None:
                     # also consider disc information appearing under misc keys
@@ -298,6 +474,7 @@ class BaseMusicClient():
                             downloading_text = "%0.2fMB/%0.2fMB" % (downloaded_size / 1024 / 1024, downloaded_size / 1024 / 1024)
                         progress.advance(song_progress_id, len(chunk))
                         progress.update(song_progress_id, description=f"{self.source}.download >>> {song_info['song_name']} (Downloading: {downloading_text})")
+                self._apply_metadata(save_path, song_info)
                 progress.advance(songs_progress_id, 1)
                 progress.update(song_progress_id, description=f"{self.source}.download >>> {song_info['song_name']} (Success)")
                 downloaded_song_info = copy.deepcopy(song_info)

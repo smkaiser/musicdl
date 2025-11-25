@@ -104,3 +104,4 @@ venv.bak/
 .mypy_cache/
 
 musicdl_outputs/
+musicdl/modules/utils/tidal_tv_session.enc
